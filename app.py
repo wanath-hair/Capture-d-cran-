@@ -1,7 +1,6 @@
 import re
 import uuid
 import json
-import base64
 import asyncio
 import subprocess
 import shutil
@@ -12,7 +11,9 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-import anthropic
+from google import genai
+from google.genai import types
+from PIL import Image
 
 app = FastAPI(title="Video Scene Analyzer")
 
@@ -30,14 +31,21 @@ RESULTS_DIR = Path("results")
 for d in [UPLOAD_DIR, FRAMES_DIR, RESULTS_DIR]:
     d.mkdir(exist_ok=True)
 
-client = anthropic.Anthropic()
+# Client Gemini — initialisé au démarrage avec la clé d'env
+import os
+_api_key = os.environ.get("GOOGLE_API_KEY", "")
+gemini = genai.Client(api_key=_api_key) if _api_key else None
+
 MAX_DURATION = 15 * 60  # 15 minutes
+GEMINI_MODEL = "gemini-2.0-flash"
+
+# Délai entre appels pour rester dans le quota gratuit (15 req/min)
+RATE_DELAY = 4.0  # secondes
 
 MODE_CONFIGS = {
     "summary": {
         "scene_threshold": 0.30,
         "interval_sec": 30,
-        "max_tokens": 512,
         "prompt": (
             "Tu analyses une frame extraite d'une vidéo. "
             "Décris précisément et de façon concise ce que tu vois : "
@@ -48,7 +56,6 @@ MODE_CONFIGS = {
     "narrative": {
         "scene_threshold": 0.20,
         "interval_sec": 5,
-        "max_tokens": 1024,
         "prompt": (
             "Tu analyses une image extraite d'une vidéo.\n"
             "Décris de façon exhaustive et fluide tout ce que tu vois à l'écran, "
@@ -88,10 +95,6 @@ def extract_scene_frames(
     scene_threshold: float,
     interval_sec: int,
 ) -> list[dict]:
-    """
-    Extrait les frames aux changements de scène + toutes les N secondes.
-    Retourne [{"frame_path": str, "timestamp": float}]
-    """
     output_dir.mkdir(parents=True, exist_ok=True)
     raw_dir = output_dir / "raw"
     raw_dir.mkdir(exist_ok=True)
@@ -120,7 +123,6 @@ def extract_scene_frames(
                 timestamps.append(float(m.group(1)))
 
     frames = sorted(raw_dir.glob("*.jpg"))
-
     scene_frames: list[dict] = []
     for i, frame in enumerate(frames):
         ts = timestamps[i] if i < len(timestamps) else None
@@ -137,7 +139,6 @@ def extract_scene_frames(
 
 
 def format_timestamp(seconds: float) -> str:
-    """HH:MM:SS.mmm — used for internal storage and summary mode display."""
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = seconds % 60
@@ -145,7 +146,6 @@ def format_timestamp(seconds: float) -> str:
 
 
 def format_script_timestamp(seconds: float) -> str:
-    """[MM:SS] or [HH:MM:SS] — used in narrative script output."""
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
@@ -154,31 +154,13 @@ def format_script_timestamp(seconds: float) -> str:
     return f"[{m:02d}:{s:02d}]"
 
 
-def analyze_frame(frame_path: str, prompt: str, max_tokens: int) -> str:
-    with open(frame_path, "rb") as f:
-        image_data = base64.standard_b64encode(f.read()).decode("utf-8")
-
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=max_tokens,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": image_data,
-                        },
-                    },
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ],
+def analyze_frame(frame_path: str, prompt: str) -> str:
+    img = Image.open(frame_path)
+    response = gemini.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[prompt, img],
     )
-    return message.content[0].text
+    return response.text
 
 
 async def analysis_stream(
@@ -191,6 +173,10 @@ async def analysis_stream(
 
     def sse(data: dict) -> str:
         return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    if not gemini:
+        yield sse({"type": "error", "message": "Clé API Google manquante. Redémarrez le serveur avec GOOGLE_API_KEY."})
+        return
 
     try:
         yield sse({"type": "status", "message": "Vérification de la vidéo…", "mode": mode})
@@ -215,10 +201,7 @@ async def analysis_stream(
         label = "Script narratif" if mode == "narrative" else "Résumé par scène"
         yield sse({
             "type": "info",
-            "message": (
-                f"Durée : {format_timestamp(duration)} — "
-                f"Extraction ({label}, 1 frame/{interval}s)…"
-            ),
+            "message": f"Durée : {format_timestamp(duration)} — Extraction ({label}, 1 frame/{interval}s)…",
             "duration": duration,
             "duration_fmt": format_timestamp(duration),
             "mode": mode,
@@ -244,7 +227,7 @@ async def analysis_stream(
 
         yield sse({
             "type": "info",
-            "message": f"{len(scene_frames)} instants à analyser. Claude travaille…",
+            "message": f"{len(scene_frames)} instants à analyser. Gemini travaille…",
             "total": len(scene_frames),
             "mode": mode,
         })
@@ -269,11 +252,7 @@ async def analysis_stream(
 
             try:
                 description = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    analyze_frame,
-                    frame["frame_path"],
-                    cfg["prompt"],
-                    cfg["max_tokens"],
+                    None, analyze_frame, frame["frame_path"], cfg["prompt"]
                 )
                 scene = {
                     "index": i + 1,
@@ -287,6 +266,9 @@ async def analysis_stream(
                 await asyncio.sleep(0)
             except Exception as e:
                 yield sse({"type": "warning", "message": f"Frame {i + 1} ignorée : {e}"})
+
+            # Respecte le quota gratuit Gemini (15 req/min)
+            await asyncio.sleep(RATE_DELAY)
 
         out = {
             "video_id": video_id,
