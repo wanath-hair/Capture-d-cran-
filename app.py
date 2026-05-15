@@ -1,4 +1,3 @@
-import os
 import re
 import uuid
 import json
@@ -9,7 +8,7 @@ import shutil
 from pathlib import Path
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,7 +32,42 @@ for d in [UPLOAD_DIR, FRAMES_DIR, RESULTS_DIR]:
 
 client = anthropic.Anthropic()
 MAX_DURATION = 15 * 60  # 15 minutes
-SCENE_THRESHOLD = 0.30  # Sensibilité détection de scène (0.0-1.0)
+
+MODE_CONFIGS = {
+    "summary": {
+        "scene_threshold": 0.30,
+        "interval_sec": 30,
+        "max_tokens": 512,
+        "prompt": (
+            "Tu analyses une frame extraite d'une vidéo. "
+            "Décris précisément et de façon concise ce que tu vois : "
+            "personnes, actions, objets importants, lieu, ambiance. "
+            "Sois factuel et direct. Maximum 3 phrases courtes."
+        ),
+    },
+    "narrative": {
+        "scene_threshold": 0.20,
+        "interval_sec": 5,
+        "max_tokens": 1024,
+        "prompt": (
+            "Tu analyses une image extraite d'une vidéo.\n"
+            "Décris de façon exhaustive et fluide tout ce que tu vois à l'écran, "
+            "comme un narrateur qui décrit un film en temps réel.\n"
+            "Couvre systématiquement :\n"
+            "– Actions, mouvements, gestes des personnes présentes\n"
+            "– Expressions du visage, postures, regards, interactions\n"
+            "– Décors, environnement, arrière-plan, éclairage, ambiance visuelle\n"
+            "– Angle de caméra, mouvement de caméra, profondeur de champ\n"
+            "– Texte affiché à l'écran, graphiques, intertitres (si visibles)\n"
+            "– Objets et éléments visuels importants au premier plan\n"
+            "– Transitions, effets visuels\n\n"
+            "NE TRANSCRIS PAS les dialogues, paroles ou voix off.\n"
+            "Sois exhaustif : rien ne doit être résumé ou omis.\n"
+            "Écris directement la narration en paragraphe continu, "
+            "sans titre, sans liste à puces, sans préambule."
+        ),
+    },
+}
 
 
 def get_video_duration(video_path: str) -> float:
@@ -48,20 +82,23 @@ def get_video_duration(video_path: str) -> float:
     return float(data["format"]["duration"])
 
 
-def extract_scene_frames(video_path: str, output_dir: Path) -> list[dict]:
+def extract_scene_frames(
+    video_path: str,
+    output_dir: Path,
+    scene_threshold: float,
+    interval_sec: int,
+) -> list[dict]:
     """
-    Extrait les frames aux changements de scène + toutes les 30s.
+    Extrait les frames aux changements de scène + toutes les N secondes.
     Retourne [{"frame_path": str, "timestamp": float}]
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Passe 1 : détecter les scènes et récupérer les timestamps précis via showinfo
-    showinfo_dir = output_dir / "raw"
-    showinfo_dir.mkdir(exist_ok=True)
+    raw_dir = output_dir / "raw"
+    raw_dir.mkdir(exist_ok=True)
 
     vf = (
-        f"select='gt(scene,{SCENE_THRESHOLD})+isnan(prev_selected_t)+"
-        f"gte(t-prev_selected_t\\,30)',showinfo,"
+        f"select='gt(scene,{scene_threshold})+isnan(prev_selected_t)+"
+        f"gte(t-prev_selected_t\\,{interval_sec})',showinfo,"
         "scale=1280:720:force_original_aspect_ratio=decrease"
     )
 
@@ -70,12 +107,11 @@ def extract_scene_frames(video_path: str, output_dir: Path) -> list[dict]:
         "-vf", vf,
         "-vsync", "vfr",
         "-q:v", "2",
-        str(showinfo_dir / "%06d.jpg")
+        str(raw_dir / "%06d.jpg")
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
-    # Extraire les timestamps depuis la sortie stderr de showinfo
     timestamps: list[float] = []
     for line in result.stderr.split("\n"):
         if "pts_time" in line and "showinfo" in line.lower():
@@ -83,40 +119,48 @@ def extract_scene_frames(video_path: str, output_dir: Path) -> list[dict]:
             if m:
                 timestamps.append(float(m.group(1)))
 
-    frames = sorted(showinfo_dir.glob("*.jpg"))
+    frames = sorted(raw_dir.glob("*.jpg"))
 
-    # Renommer avec timestamp encodé dans le nom pour tri
     scene_frames: list[dict] = []
     for i, frame in enumerate(frames):
         ts = timestamps[i] if i < len(timestamps) else None
         if ts is None:
             continue
-        ts_str = f"{ts:012.4f}".replace(".", "_")
-        dest = output_dir / f"scene_{ts_str}.jpg"
+        ts_key = f"{ts:012.4f}".replace(".", "_")
+        dest = output_dir / f"scene_{ts_key}.jpg"
         frame.rename(dest)
         scene_frames.append({"frame_path": str(dest), "timestamp": ts})
 
-    shutil.rmtree(showinfo_dir, ignore_errors=True)
-
-    # Trier par timestamp
+    shutil.rmtree(raw_dir, ignore_errors=True)
     scene_frames.sort(key=lambda x: x["timestamp"])
     return scene_frames
 
 
 def format_timestamp(seconds: float) -> str:
+    """HH:MM:SS.mmm — used for internal storage and summary mode display."""
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
-def analyze_frame(frame_path: str) -> str:
+def format_script_timestamp(seconds: float) -> str:
+    """[MM:SS] or [HH:MM:SS] — used in narrative script output."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h > 0:
+        return f"[{h:02d}:{m:02d}:{s:02d}]"
+    return f"[{m:02d}:{s:02d}]"
+
+
+def analyze_frame(frame_path: str, prompt: str, max_tokens: int) -> str:
     with open(frame_path, "rb") as f:
         image_data = base64.standard_b64encode(f.read()).decode("utf-8")
 
     message = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=512,
+        max_tokens=max_tokens,
         messages=[
             {
                 "role": "user",
@@ -129,15 +173,7 @@ def analyze_frame(frame_path: str) -> str:
                             "data": image_data,
                         },
                     },
-                    {
-                        "type": "text",
-                        "text": (
-                            "Tu analyses une frame extraite d'une vidéo. "
-                            "Décris précisément et de façon concise ce que tu vois : "
-                            "personnes, actions, objets importants, lieu, ambiance. "
-                            "Sois factuel et direct. Maximum 3 phrases courtes."
-                        ),
-                    },
+                    {"type": "text", "text": prompt},
                 ],
             }
         ],
@@ -145,15 +181,19 @@ def analyze_frame(frame_path: str) -> str:
     return message.content[0].text
 
 
-async def analysis_stream(video_id: str, video_path: str) -> AsyncGenerator[str, None]:
+async def analysis_stream(
+    video_id: str,
+    video_path: str,
+    mode: str,
+) -> AsyncGenerator[str, None]:
     frames_dir = FRAMES_DIR / video_id
+    cfg = MODE_CONFIGS[mode]
 
     def sse(data: dict) -> str:
         return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
     try:
-        # Durée
-        yield sse({"type": "status", "message": "Vérification de la vidéo…"})
+        yield sse({"type": "status", "message": "Vérification de la vidéo…", "mode": mode})
         await asyncio.sleep(0)
 
         try:
@@ -167,22 +207,32 @@ async def analysis_stream(video_id: str, video_path: str) -> AsyncGenerator[str,
         if duration > MAX_DURATION:
             yield sse({
                 "type": "error",
-                "message": f"Vidéo trop longue ({format_timestamp(duration)}). Maximum 15 minutes."
+                "message": f"Vidéo trop longue ({format_timestamp(duration)}). Maximum 15 minutes.",
             })
             return
 
+        interval = cfg["interval_sec"]
+        label = "Script narratif" if mode == "narrative" else "Résumé par scène"
         yield sse({
             "type": "info",
-            "message": f"Durée : {format_timestamp(duration)} — Extraction des scènes…",
+            "message": (
+                f"Durée : {format_timestamp(duration)} — "
+                f"Extraction ({label}, 1 frame/{interval}s)…"
+            ),
             "duration": duration,
             "duration_fmt": format_timestamp(duration),
+            "mode": mode,
         })
         await asyncio.sleep(0)
 
-        # Extraction des frames
         try:
             scene_frames = await asyncio.get_event_loop().run_in_executor(
-                None, extract_scene_frames, video_path, frames_dir
+                None,
+                extract_scene_frames,
+                video_path,
+                frames_dir,
+                cfg["scene_threshold"],
+                interval,
             )
         except Exception as e:
             yield sse({"type": "error", "message": f"Erreur extraction : {e}"})
@@ -194,16 +244,17 @@ async def analysis_stream(video_id: str, video_path: str) -> AsyncGenerator[str,
 
         yield sse({
             "type": "info",
-            "message": f"{len(scene_frames)} scènes détectées. Analyse par Claude…",
+            "message": f"{len(scene_frames)} instants à analyser. Claude travaille…",
             "total": len(scene_frames),
+            "mode": mode,
         })
         await asyncio.sleep(0)
 
-        # Analyse de chaque frame
         results: list[dict] = []
         for i, frame in enumerate(scene_frames):
             ts = frame["timestamp"]
             ts_fmt = format_timestamp(ts)
+            ts_script = format_script_timestamp(ts)
 
             yield sse({
                 "type": "progress",
@@ -211,28 +262,35 @@ async def analysis_stream(video_id: str, video_path: str) -> AsyncGenerator[str,
                 "total": len(scene_frames),
                 "percent": round((i / len(scene_frames)) * 100),
                 "timestamp": ts_fmt,
+                "script_ts": ts_script,
+                "mode": mode,
             })
             await asyncio.sleep(0)
 
             try:
                 description = await asyncio.get_event_loop().run_in_executor(
-                    None, analyze_frame, frame["frame_path"]
+                    None,
+                    analyze_frame,
+                    frame["frame_path"],
+                    cfg["prompt"],
+                    cfg["max_tokens"],
                 )
                 scene = {
                     "index": i + 1,
                     "timestamp": ts,
                     "timestamp_fmt": ts_fmt,
+                    "script_ts": ts_script,
                     "description": description,
                 }
                 results.append(scene)
-                yield sse({"type": "scene", "scene": scene})
+                yield sse({"type": "scene", "scene": scene, "mode": mode})
                 await asyncio.sleep(0)
             except Exception as e:
-                yield sse({"type": "warning", "message": f"Frame {i+1} ignorée : {e}"})
+                yield sse({"type": "warning", "message": f"Frame {i + 1} ignorée : {e}"})
 
-        # Sauvegarde
         out = {
             "video_id": video_id,
+            "mode": mode,
             "duration": duration,
             "duration_fmt": format_timestamp(duration),
             "total_scenes": len(results),
@@ -242,7 +300,7 @@ async def analysis_stream(video_id: str, video_path: str) -> AsyncGenerator[str,
             json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-        yield sse({"type": "complete", "total_scenes": len(results), "video_id": video_id})
+        yield sse({"type": "complete", "total_scenes": len(results), "video_id": video_id, "mode": mode})
 
     except Exception as e:
         yield sse({"type": "error", "message": str(e)})
@@ -252,12 +310,8 @@ async def analysis_stream(video_id: str, video_path: str) -> AsyncGenerator[str,
 
 @app.post("/upload")
 async def upload_video(file: UploadFile = File(...)):
-    allowed = {
-        "video/mp4", "video/mpeg", "video/quicktime",
-        "video/x-msvideo", "video/webm", "video/x-matroska",
-    }
     content_type = file.content_type or ""
-    if not content_type.startswith("video/") and content_type not in allowed:
+    if not content_type.startswith("video/"):
         raise HTTPException(status_code=400, detail=f"Format non supporté : {content_type}")
 
     video_id = str(uuid.uuid4())
@@ -271,13 +325,16 @@ async def upload_video(file: UploadFile = File(...)):
 
 
 @app.get("/analyze/{video_id}")
-async def analyze_video(video_id: str):
+async def analyze_video(
+    video_id: str,
+    mode: str = Query(default="summary", pattern="^(summary|narrative)$"),
+):
     matches = list(UPLOAD_DIR.glob(f"{video_id}.*"))
     if not matches:
         raise HTTPException(status_code=404, detail="Vidéo introuvable")
 
     return StreamingResponse(
-        analysis_stream(video_id, str(matches[0])),
+        analysis_stream(video_id, str(matches[0]), mode),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

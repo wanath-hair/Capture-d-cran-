@@ -1,6 +1,7 @@
 /* ─── State ─────────────────────────────────────────────────────────────────── */
 let currentVideoId = null;
 let currentResults = null;
+let currentMode    = "summary";
 let analysisSource = null;
 
 /* ─── DOM refs ──────────────────────────────────────────────────────────────── */
@@ -11,59 +12,65 @@ const fileName       = document.getElementById("file-name");
 const fileSize       = document.getElementById("file-size");
 const resetBtn       = document.getElementById("reset-btn");
 const analyzeBtn     = document.getElementById("analyze-btn");
-const uploadSection  = document.getElementById("upload-section");
 const progressSect   = document.getElementById("progress-section");
 const progressTitle  = document.getElementById("progress-title");
 const progressBar    = document.getElementById("progress-bar");
 const progressCount  = document.getElementById("progress-counter");
 const progressStatus = document.getElementById("progress-status");
 const resultsSect    = document.getElementById("results-section");
+const resultsTitle   = document.getElementById("results-title");
 const resultsMeta    = document.getElementById("results-meta");
-const timeline       = document.getElementById("timeline");
-const exportBtn      = document.getElementById("export-btn");
+const outputArea     = document.getElementById("output-area");
+const exportJsonBtn  = document.getElementById("export-json-btn");
+const exportTxtBtn   = document.getElementById("export-txt-btn");
 const newBtn         = document.getElementById("new-btn");
 const errorBanner    = document.getElementById("error-banner");
 const errorText      = document.getElementById("error-text");
+const labelSummary   = document.getElementById("label-summary");
+const labelNarrative = document.getElementById("label-narrative");
 
 /* ─── Helpers ───────────────────────────────────────────────────────────────── */
-function formatBytes(bytes) {
-  if (bytes < 1024) return bytes + " o";
-  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " Ko";
-  return (bytes / 1048576).toFixed(1) + " Mo";
+function formatBytes(b) {
+  if (b < 1024) return b + " o";
+  if (b < 1048576) return (b / 1024).toFixed(1) + " Ko";
+  return (b / 1048576).toFixed(1) + " Mo";
 }
 
 function showError(msg) {
   errorText.textContent = msg;
   errorBanner.classList.remove("hidden");
-  setTimeout(() => errorBanner.classList.add("hidden"), 8000);
+  setTimeout(() => errorBanner.classList.add("hidden"), 10000);
 }
 
-function hideError() {
-  errorBanner.classList.add("hidden");
+function hideError() { errorBanner.classList.add("hidden"); }
+
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-/* Format "HH:MM:SS.mmm" → split into main + ms part for display */
-function splitTimestamp(ts) {
-  const parts = ts.split(".");
-  return { main: parts[0], ms: parts[1] ? "." + parts[1] : "" };
-}
+/* ─── Mode toggle ───────────────────────────────────────────────────────────── */
+document.querySelectorAll('input[name="mode"]').forEach(radio => {
+  radio.addEventListener("change", () => {
+    currentMode = radio.value;
+    labelSummary.classList.toggle("active", currentMode === "summary");
+    labelNarrative.classList.toggle("active", currentMode === "narrative");
+  });
+});
 
 /* ─── Upload / Drop ─────────────────────────────────────────────────────────── */
 dropZone.addEventListener("click", () => fileInput.click());
-dropZone.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") fileInput.click(); });
-
+dropZone.addEventListener("keydown", e => {
+  if (e.key === "Enter" || e.key === " ") fileInput.click();
+});
 dropZone.addEventListener("dragover", e => {
-  e.preventDefault();
-  dropZone.classList.add("dragover");
+  e.preventDefault(); dropZone.classList.add("dragover");
 });
 dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));
 dropZone.addEventListener("drop", e => {
-  e.preventDefault();
-  dropZone.classList.remove("dragover");
-  const file = e.dataTransfer.files[0];
-  if (file) handleFile(file);
+  e.preventDefault(); dropZone.classList.remove("dragover");
+  if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
 });
-
 fileInput.addEventListener("change", () => {
   if (fileInput.files[0]) handleFile(fileInput.files[0]);
 });
@@ -82,8 +89,7 @@ function handleFile(file) {
 }
 
 resetBtn.addEventListener("click", () => {
-  fileInput.value = "";
-  fileInput._file = null;
+  fileInput.value = ""; fileInput._file = null;
   filePreview.classList.add("hidden");
   dropZone.classList.remove("hidden");
   hideError();
@@ -97,7 +103,7 @@ analyzeBtn.addEventListener("click", async () => {
   analyzeBtn.disabled = true;
   hideError();
 
-  /* 1. Upload */
+  /* Upload */
   progressSect.classList.remove("hidden");
   progressTitle.textContent = "Envoi de la vidéo…";
   progressStatus.textContent = "Transfert en cours…";
@@ -117,25 +123,28 @@ analyzeBtn.addEventListener("click", async () => {
     uploadRes = await res.json();
   } catch (e) {
     showError("Échec de l'envoi : " + e.message);
-    resetUI();
-    return;
+    resetUI(); return;
   }
 
   currentVideoId = uploadRes.video_id;
-  currentResults = { scenes: [] };
+  currentResults = { mode: currentMode, scenes: [] };
 
-  /* 2. Stream analysis */
-  progressTitle.textContent = "Analyse en cours…";
-  timeline.innerHTML = "";
+  /* Prépare la zone de résultats */
+  outputArea.innerHTML = "";
   resultsSect.classList.add("hidden");
+  progressTitle.textContent = "Analyse en cours…";
 
-  analysisSource = new EventSource(`/analyze/${currentVideoId}`);
+  if (currentMode === "narrative") {
+    outputArea.className = "script-view";
+    resultsTitle.textContent = "Script narratif";
+  } else {
+    outputArea.className = "timeline";
+    resultsTitle.textContent = "Résultats de l'analyse";
+  }
 
-  analysisSource.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
-    handleSSE(msg);
-  };
-
+  /* SSE */
+  analysisSource = new EventSource(`/analyze/${currentVideoId}?mode=${currentMode}`);
+  analysisSource.onmessage = e => handleSSE(JSON.parse(e.data));
   analysisSource.onerror = () => {
     analysisSource.close();
     showError("Connexion interrompue pendant l'analyse.");
@@ -143,6 +152,7 @@ analyzeBtn.addEventListener("click", async () => {
   };
 });
 
+/* ─── SSE handler ───────────────────────────────────────────────────────────── */
 function handleSSE(msg) {
   switch (msg.type) {
 
@@ -153,19 +163,25 @@ function handleSSE(msg) {
       break;
 
     case "progress":
-      progressTitle.textContent = "Analyse des scènes…";
       progressBar.style.width = msg.percent + "%";
       progressCount.textContent = `${msg.current} / ${msg.total}`;
-      progressStatus.textContent = `Scène ${msg.current} — t = ${msg.timestamp}`;
+      progressStatus.textContent =
+        msg.mode === "narrative"
+          ? `t = ${msg.script_ts}  (${msg.current}/${msg.total})`
+          : `Scène ${msg.current} — t = ${msg.timestamp}`;
       break;
 
     case "scene": {
-      const scene = msg.scene;
-      if (!currentResults) currentResults = { scenes: [] };
+      const { scene, mode } = msg;
+      if (!currentResults) currentResults = { mode, scenes: [] };
       currentResults.scenes.push(scene);
-      appendSceneCard(scene);
 
-      /* Show results section on first scene */
+      if (mode === "narrative") {
+        appendScriptLine(scene);
+      } else {
+        appendSceneCard(scene);
+      }
+
       if (currentResults.scenes.length === 1) {
         resultsSect.classList.remove("hidden");
         resultsMeta.textContent = "Analyse en cours…";
@@ -178,12 +194,12 @@ function handleSSE(msg) {
       progressSect.classList.add("hidden");
       resultsSect.classList.remove("hidden");
       resultsMeta.textContent =
-        `${msg.total_scenes} scène${msg.total_scenes > 1 ? "s" : ""} détectée${msg.total_scenes > 1 ? "s" : ""}`;
+        `${msg.total_scenes} instant${msg.total_scenes > 1 ? "s" : ""} analysé${msg.total_scenes > 1 ? "s" : ""}`;
       analyzeBtn.disabled = false;
       break;
 
     case "warning":
-      console.warn("VideoScene warning:", msg.message);
+      console.warn("VideoScene:", msg.message);
       break;
 
     case "error":
@@ -194,47 +210,71 @@ function handleSSE(msg) {
   }
 }
 
+/* ─── Summary mode — carte timeline ────────────────────────────────────────── */
 function appendSceneCard(scene) {
-  const { main, ms } = splitTimestamp(scene.timestamp_fmt);
+  const tsParts = scene.timestamp_fmt.split(".");
+  const main = tsParts[0];
+  const ms   = tsParts[1] ? "." + tsParts[1] : "";
 
   const card = document.createElement("div");
   card.className = "scene-card";
-  card.style.animationDelay = "0.05s";
   card.innerHTML = `
-    <div class="scene-ts">
-      ${main}<span class="ts-ms">${ms}</span>
-    </div>
+    <div class="scene-ts">${main}<span class="ts-ms">${ms}</span></div>
     <div class="scene-dot"></div>
     <div class="scene-body">
       <div class="scene-index">Scène ${scene.index}</div>
       <div class="scene-desc">${escapeHtml(scene.description)}</div>
-    </div>
-  `;
-  timeline.appendChild(card);
+    </div>`;
+  outputArea.appendChild(card);
   card.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
-function escapeHtml(str) {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+/* ─── Narrative mode — ligne de script ──────────────────────────────────────── */
+function appendScriptLine(scene) {
+  const line = document.createElement("div");
+  line.className = "script-line";
+  line.innerHTML =
+    `<span class="script-ts">${escapeHtml(scene.script_ts)}</span>` +
+    `<span class="script-text">${escapeHtml(scene.description)}</span>`;
+  outputArea.appendChild(line);
+  line.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
-/* ─── Export ────────────────────────────────────────────────────────────────── */
-exportBtn.addEventListener("click", () => {
+/* ─── Exports ───────────────────────────────────────────────────────────────── */
+exportJsonBtn.addEventListener("click", () => {
   if (!currentResults) return;
-  const blob = new Blob([JSON.stringify(currentResults, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `videoscene_${currentVideoId?.slice(0, 8) || "export"}.json`;
-  a.click();
-  URL.revokeObjectURL(url);
+  download(
+    JSON.stringify(currentResults, null, 2),
+    `videoscene_${currentVideoId?.slice(0, 8) || "export"}.json`,
+    "application/json"
+  );
 });
 
-/* ─── New video ─────────────────────────────────────────────────────────────── */
+exportTxtBtn.addEventListener("click", () => {
+  if (!currentResults || !currentResults.scenes.length) return;
+  const lines = currentResults.scenes.map(s => `${s.script_ts} ${s.description}`);
+  const header =
+    `SCRIPT NARRATIF — VideoScene\n` +
+    `Mode : ${currentResults.mode === "narrative" ? "Script narratif exhaustif" : "Résumé par scène"}\n` +
+    `Durée : ${currentResults.scenes.at(-1)?.timestamp_fmt || "—"}\n` +
+    `Instants analysés : ${currentResults.scenes.length}\n` +
+    `─────────────────────────────────────────\n\n`;
+  download(
+    header + lines.join("\n\n"),
+    `script_${currentVideoId?.slice(0, 8) || "export"}.txt`,
+    "text/plain"
+  );
+});
+
+function download(content, filename, type) {
+  const blob = new Blob([content], { type });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+/* ─── Nouvelle vidéo ────────────────────────────────────────────────────────── */
 newBtn.addEventListener("click", () => {
   if (currentVideoId) {
     fetch(`/cleanup/${currentVideoId}`, { method: "DELETE" }).catch(() => {});
@@ -242,13 +282,12 @@ newBtn.addEventListener("click", () => {
   }
   currentResults = null;
   if (analysisSource) { analysisSource.close(); analysisSource = null; }
-  timeline.innerHTML = "";
+  outputArea.innerHTML = "";
   resultsSect.classList.add("hidden");
   progressSect.classList.add("hidden");
   filePreview.classList.add("hidden");
   dropZone.classList.remove("hidden");
-  fileInput.value = "";
-  fileInput._file = null;
+  fileInput.value = ""; fileInput._file = null;
   analyzeBtn.disabled = false;
   hideError();
 });

@@ -132,9 +132,16 @@ main {
   border-radius: var(--radius);
   padding: 20px 24px;
   display: flex;
+  flex-direction: column;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.file-preview-row {
+  display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 12px;
   flex-wrap: wrap;
 }
 
@@ -143,7 +150,7 @@ main {
   align-items: center;
   gap: 12px;
   color: var(--text-dim);
-  flex: 1;
+  width: 100%;
 }
 
 .preview-text {
@@ -394,6 +401,96 @@ main {
   padding: 14px 18px;
   border-radius: var(--radius-sm);
   font-size: 0.9rem;
+}
+
+/* ─── Mode Toggle ──────────────────────────────────────────────────────────── */
+.mode-toggle {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  width: 100%;
+}
+
+.mode-option {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s, color 0.2s;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  font-weight: 500;
+  user-select: none;
+}
+
+.mode-option input[type="radio"] { display: none; }
+
+.mode-option em {
+  font-style: normal;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  background: var(--surface);
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+.mode-option.active,
+.mode-option:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent-hover);
+}
+
+.mode-option.active em,
+.mode-option:has(input:checked) em {
+  border-color: rgba(99,102,241,0.3);
+  color: var(--accent-hover);
+  background: transparent;
+}
+
+/* ─── Script View (narrative mode) ────────────────────────────────────────── */
+.script-view {
+  font-family: 'Georgia', 'Times New Roman', serif;
+  font-size: 0.95rem;
+  line-height: 1.8;
+  color: var(--text-dim);
+  margin-top: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.script-line {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  gap: 16px;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(42, 47, 62, 0.5);
+  animation: fadeIn 0.25s ease forwards;
+  opacity: 0;
+}
+
+.script-line:last-child { border-bottom: none; }
+
+.script-ts {
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--accent-hover);
+  padding-top: 3px;
+  white-space: nowrap;
+  letter-spacing: 0.03em;
+}
+
+.script-text {
+  color: var(--text);
+  font-size: 0.9rem;
+  line-height: 1.75;
 }
 
 /* ─── Utilities ────────────────────────────────────────────────────────────── */
