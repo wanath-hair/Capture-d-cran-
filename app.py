@@ -37,7 +37,7 @@ _api_key = os.environ.get("GOOGLE_API_KEY", "")
 gemini = genai.Client(api_key=_api_key) if _api_key else None
 
 MAX_DURATION = 15 * 60  # 15 minutes
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 # Délai entre appels pour rester dans le quota gratuit (15 req/min)
 RATE_DELAY = 4.0  # secondes
